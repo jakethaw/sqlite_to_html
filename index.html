@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en-us">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <title>SQLite to HTML</title>
+    <style>
+      td {
+          vertical-align: top;
+          padding-bottom: 5px;
+      }
+    </style>
+  </head>
+  <body onload="initialise()">
+    <h1>SQLite to HTML</h1>
+    
+    <a href="https://github.com/jakethaw/sqlite_to_html">github.com/jakethaw/sqlite_to_html</a>
+    
+    <br>
+    <br>
+
+    <select name="file" id="file" onchange="select_file()">
+      <option value="graph.sql">graph.sql</option>
+      <option value="affine.sql">affine.sql</option>
+      <option value="dragon.sql">dragon.sql</option>
+      <option value="serpinski.sql">serpinski.sql</option>
+    </select>
+    
+    <table>
+      <tr>
+        <td style="padding-right:20px">
+          <textarea id="sql" wrap="off" rows="35" cols="80"></textarea>
+        </td>
+        <td>
+          <div id="svg"></div>
+        </td>
+      </tr>
+    </table>
+
+    <script async type="text/javascript" src="sqlite3.js"></script>
+    <script>
+
+      function allocateUTF8OnStack(str) {
+        var size = lengthBytesUTF8(str) + 1;
+        var ret = stackAlloc(size);
+        stringToUTF8Array(str, HEAP8, ret, size);
+        return ret
+      }
+
+      function sqlite_main(args) {
+        assert(runDependencies == 0, 'cannot call main when async dependencies remain! (listen on Module["onRuntimeInitialized"])');
+        assert(__ATPRERUN__.length == 0, "cannot call main when preRun functions remain to be called");
+        var entryFunction = Module["_sqlite_main"];
+        args = args || [];
+        var argc = args.length + 1;
+        var argv = stackAlloc((argc + 1) * 4);
+        HEAP32[argv >> 2] = allocateUTF8OnStack(thisProgram);
+        for (var i = 1; i < argc; i++) {
+          HEAP32[(argv >> 2) + i] = allocateUTF8OnStack(args[i - 1])
+        }
+        HEAP32[(argv >> 2) + argc] = 0;
+        try {
+          var ret = entryFunction(argc, argv);
+          exit(ret, true)
+        } catch (e) {
+          if (e instanceof ExitStatus) {
+            return
+          } else if (e == "unwind") {
+            noExitRuntime = true;
+            return
+          } else {
+            var toLog = e;
+            if (e && typeof e === "object" && e.stack) {
+                toLog = [e, e.stack]
+            }
+            err("exception thrown: " + toLog);
+            quit_(1, e)
+          }
+        }
+      }
+
+      // Run content of textarea in SQLite CLI
+      var timer = 0;
+      var file = document.getElementById("file").value;
+      var eval_wait = 0;
+      function eval_sql(){
+        if( eval_wait == 0 ){
+          eval_wait = 1;
+          var sql = document.getElementById("sql").value;
+          FS.writeFile(file, sql);
+          sqlite_main([':memory:', '.param init', `.param set $timer ${timer}`, `.read ${file}`]);
+          document.getElementById('svg').innerHTML = FS.readFile('output.svg', { encoding: 'utf8' });
+          eval_wait = 0;
+        }
+        timer += 1;
+      }
+
+      function select_file(){
+        var e = document.getElementById("file");
+        file = e.options[e.selectedIndex].value;
+        timer = 0;
+
+        // Get file
+        fetch(file)
+          .then(response => response.text())
+          .then(data => {
+            document.getElementById("sql").value = data;
+            FS.writeFile(file, data);
+          });
+      }
+
+      function initialise(){
+        select_file();
+        wait_sqlite_load();
+      };
+
+      function wait_sqlite_load(){
+        if(runDependencies == 0 && __ATPRERUN__.length == 0){
+          setInterval(eval_sql, 30);
+        }else{
+          setTimeout(wait_sqlite_load, 10);
+        }
+      }
+
+    </script>
+
+  </body>
+</html>
+
+
