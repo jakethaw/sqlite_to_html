@@ -8,10 +8,11 @@
       td {
           vertical-align: top;
           padding-bottom: 5px;
+          padding-right: 20px;
       }
     </style>
   </head>
-  <body onload="initialise()">
+  <body>
     <h1>SQLite to HTML</h1>
     
     <a href="https://github.com/jakethaw/sqlite_to_html">github.com/jakethaw/sqlite_to_html</a>
@@ -29,8 +30,10 @@
     
     <table>
       <tr>
-        <td style="padding-right:20px">
+        <td>
           <textarea id="sql" wrap="off" rows="35" cols="80"></textarea>
+          <br>
+          <div id="error" style="color:red">error</div>
         </td>
         <td>
           <div id="svg"></div>
@@ -38,58 +41,30 @@
       </tr>
     </table>
 
-    <script async type="text/javascript" src="sqlite3.js"></script>
     <script>
 
-      function allocateUTF8OnStack(str) {
-        var size = lengthBytesUTF8(str) + 1;
-        var ret = stackAlloc(size);
-        stringToUTF8Array(str, HEAP8, ret, size);
-        return ret
-      }
-
-      function sqlite_main(args) {
-        assert(runDependencies == 0, 'cannot call main when async dependencies remain! (listen on Module["onRuntimeInitialized"])');
-        assert(__ATPRERUN__.length == 0, "cannot call main when preRun functions remain to be called");
-        var entryFunction = Module["_sqlite_main"];
-        args = args || [];
-        var argc = args.length + 1;
-        var argv = stackAlloc((argc + 1) * 4);
-        HEAP32[argv >> 2] = allocateUTF8OnStack(thisProgram);
-        for (var i = 1; i < argc; i++) {
-          HEAP32[(argv >> 2) + i] = allocateUTF8OnStack(args[i - 1])
-        }
-        HEAP32[(argv >> 2) + argc] = 0;
-        try {
-          var ret = entryFunction(argc, argv);
-          exit(ret, true)
-        } catch (e) {
-          if (e instanceof ExitStatus) {
-            return
-          } else if (e == "unwind") {
-            noExitRuntime = true;
-            return
-          } else {
-            var toLog = e;
-            if (e && typeof e === "object" && e.stack) {
-                toLog = [e, e.stack]
-            }
-            err("exception thrown: " + toLog);
-            quit_(1, e)
-          }
-        }
-      }
-
-      // Run content of textarea in SQLite CLI
       var timer = 0;
       var file = document.getElementById("file").value;
       var eval_wait = 0;
+
+      var Module = {
+        // onRuntimeInitialized: function() { 
+        //   select_file();
+        //   // // Evaluate every 30ms
+        //   // setInterval(eval_sql, 30); 
+        // },
+        noInitialRun: true,
+        printErr: function(text) { document.getElementById("error").innerText += text + '\n'; }
+      };
+
+      // Run content of textarea in SQLite CLI
       function eval_sql(){
         if( eval_wait == 0 ){
           eval_wait = 1;
-          var sql = document.getElementById("sql").value;
+          const sql = document.getElementById("sql").value;
           FS.writeFile(file, sql);
-          sqlite_main([':memory:', '.param init', `.param set $timer ${timer}`, `.read ${file}`]);
+          document.getElementById("error").innerText = '';
+          callMain([':memory:', '.param init', `.param set $timer ${timer}`, `.read ${file}`]);
           document.getElementById('svg').innerHTML = FS.readFile('output.svg', { encoding: 'utf8' });
           eval_wait = 0;
         }
@@ -110,20 +85,19 @@
           });
       }
 
-      function initialise(){
-        select_file();
-        wait_sqlite_load();
-      };
-
-      function wait_sqlite_load(){
+      var runDependencies = 1;
+      function wait_load(){
         if(runDependencies == 0 && __ATPRERUN__.length == 0){
+          select_file();
           setInterval(eval_sql, 30);
         }else{
-          setTimeout(wait_sqlite_load, 10);
+          setTimeout(wait_load, 50);
         }
       }
+      wait_load();
 
     </script>
+    <script type="text/javascript" src="sqlite3.js"></script>
 
   </body>
 </html>

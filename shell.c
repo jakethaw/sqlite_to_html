@@ -19079,7 +19079,8 @@ static int process_input(ShellState *p){
   }
   free(zSql);
   free(zLine);
-  return errCnt>0;
+  //return errCnt>0;
+  return 0;
 }
 
 /*
@@ -19340,7 +19341,7 @@ static char *cmdline_option_value(int argc, char **argv, int i){
 #endif
 
 #if SQLITE_SHELL_IS_UTF8
-int SQLITE_CDECL sqlite_main(int argc, char **argv){
+int SQLITE_CDECL main(int argc, char **argv){
 #else
 int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
 
@@ -19876,9 +19877,6 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
   free(data.colWidth);
   /* Clear the global data structure so that valgrind will detect memory
   ** leaks */
-  // close_db(data.db);
-  // printf("%llu\n", sqlite3_memory_used());
-  sqlite3_shutdown();
   memset(&data, 0, sizeof(data));
   return rc;
 }
