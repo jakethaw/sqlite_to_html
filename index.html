@@ -15,18 +15,19 @@
   <body>
     <h1>SQLite to HTML</h1>
     
-    <a href="https://github.com/jakethaw/sqlite_to_html">github.com/jakethaw/sqlite_to_html</a>
+    <p>
+      <a href="https://github.com/jakethaw/sqlite_to_html">github.com/jakethaw/sqlite_to_html</a>
+    </p>
     
-    <br>
-    <br>
-
-    <select name="file" id="file" onchange="select_file()">
-      <option value="graph.sql">graph.sql</option>
-      <option value="affine.sql">affine.sql</option>
-      <option value="dragon.sql">dragon.sql</option>
-      <option value="serpinski.sql">serpinski.sql</option>
-      <option value="cubes.sql">cubes.sql</option>
-    </select>
+    <p>
+      <select name="file" id="file" onchange="select_file()">
+        <option value="graph.sql">graph.sql</option>
+        <option value="affine.sql">affine.sql</option>
+        <option value="dragon.sql">dragon.sql</option>
+        <option value="serpinski.sql">serpinski.sql</option>
+        <option value="cubes.sql">cubes.sql</option>
+      </select>
+    </p>
     
     <table>
       <tr>
@@ -41,18 +42,19 @@
       </tr>
     </table>
 
-    <script>
+    <script async>
 
-      var timer = 0;
-      var file = document.getElementById("file").value;
-      var eval_wait = 0;
+      let timer = 0;
+      let file = document.getElementById("file").value;
+      let eval_wait = 0;
 
+      // https://emscripten.org/docs/api_reference/module.html
       var Module = {
-        // onRuntimeInitialized: function() { 
-        //   select_file();
-        //   // // Evaluate every 30ms
-        //   // setInterval(eval_sql, 30); 
-        // },
+        onRuntimeInitialized: async function() { 
+          await select_file();
+          // Evaluate every 30ms
+          setInterval(eval_sql, 30); 
+        },
         noInitialRun: true,
         printErr: function(text) { document.getElementById("error").innerText += text + '\n'; }
       };
@@ -71,35 +73,24 @@
         timer += 1;
       }
 
-      function select_file(){
-        var e = document.getElementById("file");
-        file = e.options[e.selectedIndex].value;
-        timer = 0;
+      async function select_file(){
+        try {
+          let e = document.getElementById("file");
+          file = e.options[e.selectedIndex].value;
+          timer = 0;
 
-        // Get file
-        fetch(file)
-          .then(response => response.text())
-          .then(data => {
-            document.getElementById("sql").value = data;
-            FS.writeFile(file, data);
-          });
+          // Get file
+          await fetch(file)
+            .then(response => response.text())
+            .then(data => {
+              document.getElementById("sql").value = data;
+              FS.writeFile(file, data);
+            });
+
+        } catch(e) { console.log(e); }
       }
-
-      var runDependencies = 1;
-      function wait_load(){
-        if(runDependencies == 0 && __ATPRERUN__.length == 0){
-          select_file();
-          setInterval(eval_sql, 30);
-        }else{
-          setTimeout(wait_load, 50);
-        }
-      }
-      wait_load();
-
     </script>
-    <script type="text/javascript" src="sqlite3.js"></script>
+    <script async type="text/javascript" src="sqlite3.js"></script>
 
   </body>
 </html>
-
-
