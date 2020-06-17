@@ -34,7 +34,7 @@
         <td>
           <textarea id="sql" wrap="off" rows="35" cols="80"></textarea>
           <br>
-          <div id="error" style="color:red">error</div>
+          <div id="error" style="color:red"></div>
         </td>
         <td>
           <div id="svg"></div>
@@ -50,13 +50,13 @@
 
       // https://emscripten.org/docs/api_reference/module.html
       var Module = {
-        onRuntimeInitialized: async function() { 
+        'onRuntimeInitialized': async function() { 
           await select_file();
           // Evaluate every 30ms
           setInterval(eval_sql, 30); 
         },
-        noInitialRun: true,
-        printErr: function(text) { document.getElementById("error").innerText += text + '\n'; }
+        'noInitialRun': true,
+        'printErr': function(text) { document.getElementById("error").innerText += text + '\n'; }
       };
 
       // Run content of textarea in SQLite CLI
@@ -66,11 +66,35 @@
           const sql = document.getElementById("sql").value;
           FS.writeFile(file, sql);
           document.getElementById("error").innerText = '';
-          callMain([':memory:', '.param init', `.param set $timer ${timer}`, `.read ${file}`]);
+          sqlite_main([
+            ':memory:',
+            '.param init',
+            `.param set $timer ${timer}`,
+            `.read ${file}`
+          ]);
           document.getElementById('svg').innerHTML = FS.readFile('output.svg', { encoding: 'utf8' });
           eval_wait = 0;
         }
         timer += 1;
+      }
+
+      // Call SQLite shell main function
+      function sqlite_main(args){
+          let argc = args.length+1;
+          let argv = _malloc((argc + 1) * 4);
+          HEAP32[argv >> 2] = allocateUTF8(thisProgram);
+          for (let i = 1; i < argc; i++) {
+            HEAP32[(argv >> 2) + i] = allocateUTF8(args[i - 1]);
+          }
+          HEAP32[(argv >> 2) + argc] = 0;
+
+          let ret = Module['_main'](argc, argv);
+
+          _free(HEAP32[argv >> 2]);
+          for (let i = 1; i < argc; i++) {
+            _free(HEAP32[(argv >> 2) + i]);
+          }
+          _free(argv);
       }
 
       async function select_file(){
