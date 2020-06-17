@@ -9834,6 +9834,7 @@ struct ShellState {
 #define SHFLG_Newlines       0x00000010 /* .dump --newline flag */
 #define SHFLG_CountChanges   0x00000020 /* .changes setting */
 #define SHFLG_Echo           0x00000040 /* .echo or --echo setting */
+#define SHFLG_HeaderSet      0x00000080 /* .header has been used */
 
 /*
 ** Macros for testing and setting shellFlgs
@@ -11718,10 +11719,7 @@ static void exec_prepared_stmt_columnar(
     sqlite3_free_table(azData);
     return;
   }
-  if( nRow==0 || nColumn==0 ){
-    sqlite3_free_table(azData);
-    return;
-  }
+  if( nRow==0 || nColumn==0 ) goto columnar_end;
   if( nColumn>p->nWidth ){
     p->colWidth = realloc(p->colWidth, nColumn*2*sizeof(int));
     if( p->colWidth==0 ) shell_out_of_memory();
@@ -11743,6 +11741,7 @@ static void exec_prepared_stmt_columnar(
     j = i%nColumn;
     if( n>p->actualWidth[j] ) p->actualWidth[j] = n;
   }
+  if( seenInterrupt ) goto columnar_end;
   switch( p->cMode ){
     case MODE_Column: {
       colSep = "  ";
@@ -11816,6 +11815,7 @@ static void exec_prepared_stmt_columnar(
     if( j==nColumn-1 ){
       utf8_printf(p->out, "%s", rowSep);
       j = -1;
+      if( seenInterrupt ) goto columnar_end;
     }else{
       utf8_printf(p->out, "%s", colSep);
     }
@@ -11824,6 +11824,10 @@ static void exec_prepared_stmt_columnar(
     print_row_separator(p, nColumn, "+");
   }else if( p->cMode==MODE_Box ){
     print_box_row_separator(p, nColumn, BOX_12, BOX_124, BOX_14);
+  }
+columnar_end:
+  if( seenInterrupt ){
+    utf8_printf(p->out, "Interrupt\n");
   }
   sqlite3_free_table(azData);
 }
@@ -12597,7 +12601,7 @@ static const char *(azHelp[]) = {
   "       -e     Send output to the system text editor",
   "       -x     Send output as CSV to a spreadsheet (same as \".excel\")",
 #ifdef SQLITE_DEBUG
-  ".oom [--repeat M] [N]    Simulate an OOM error on the N-th allocation",
+  ".oom ?--repeat M? ?N?    Simulate an OOM error on the N-th allocation",
 #endif 
   ".open ?OPTIONS? ?FILE?   Close existing database and reopen FILE",
   "     Options:",
@@ -16636,6 +16640,7 @@ static int do_meta_command(char *zLine, ShellState *p){
   if( c=='h' && strncmp(azArg[0], "headers", n)==0 ){
     if( nArg==2 ){
       p->showHeader = booleanValue(azArg[1]);
+      p->shellFlgs |= SHFLG_HeaderSet;
     }else{
       raw_printf(stderr, "Usage: .headers on|off\n");
       rc = 1;
@@ -17158,6 +17163,9 @@ static int do_meta_command(char *zLine, ShellState *p){
       sqlite3_snprintf(sizeof(p->rowSeparator), p->rowSeparator, SEP_Row);
     }else if( c2=='c' && strncmp(azArg[1],"columns",n2)==0 ){
       p->mode = MODE_Column;
+      if( (p->shellFlgs & SHFLG_HeaderSet)==0 ){
+        p->showHeader = 1;
+      }
       sqlite3_snprintf(sizeof(p->rowSeparator), p->rowSeparator, SEP_Row);
     }else if( c2=='l' && n2>2 && strncmp(azArg[1],"list",n2)==0 ){
       p->mode = MODE_List;
@@ -17692,8 +17700,11 @@ static int do_meta_command(char *zLine, ShellState *p){
       }
     }
     if( zName!=0 ){
-      int isMaster = sqlite3_strlike(zName, "sqlite_master", '\\')==0;
-      if( isMaster || sqlite3_strlike(zName,"sqlite_temp_master", '\\')==0 ){
+      int isMaster = sqlite3_strlike(zName, "sqlite_master", '\\')==0
+                  || sqlite3_strlike(zName, "sqlite_schema", '\\')==0
+                  || sqlite3_strlike(zName,"sqlite_temp_master", '\\')==0
+                  || sqlite3_strlike(zName,"sqlite_temp_schema", '\\')==0;
+      if( isMaster ){
         char *new_argv[2], *new_colv[2];
         new_argv[0] = sqlite3_mprintf(
                       "CREATE TABLE %s (\n"
@@ -17702,7 +17713,7 @@ static int do_meta_command(char *zLine, ShellState *p){
                       "  tbl_name text,\n"
                       "  rootpage integer,\n"
                       "  sql text\n"
-                      ")", isMaster ? "sqlite_master" : "sqlite_temp_master");
+                      ")", zName);
         new_argv[1] = 0;
         new_colv[0] = "sql";
         new_colv[1] = 0;
@@ -19079,8 +19090,10 @@ static int process_input(ShellState *p){
   }
   free(zSql);
   free(zLine);
-  //return errCnt>0;
+#if defined(EMCC)
   return 0;
+#endif
+  return errCnt>0;
 }
 
 /*
@@ -19096,16 +19109,16 @@ static char *find_home_dir(int clearFlag){
   }
   if( home_dir ) return home_dir;
 
-// #if !defined(_WIN32) && !defined(WIN32) && !defined(_WIN32_WCE) \
-//      && !defined(__RTP__) && !defined(_WRS_KERNEL)
-//   {
-//     struct passwd *pwent;
-//     uid_t uid = getuid();
-//     if( (pwent=getpwuid(uid)) != NULL) {
-//       home_dir = pwent->pw_dir;
-//     }
-//   }
-// #endif
+#if !defined(EMCC) && !defined(_WIN32) && !defined(WIN32) && !defined(_WIN32_WCE) \
+     && !defined(__RTP__) && !defined(_WRS_KERNEL)
+  {
+    struct passwd *pwent;
+    uid_t uid = getuid();
+    if( (pwent=getpwuid(uid)) != NULL) {
+      home_dir = pwent->pw_dir;
+    }
+  }
+#endif
 
 #if defined(_WIN32_WCE)
   /* Windows CE (arm-wince-mingw32ce-gcc) does not provide getenv()
@@ -19270,6 +19283,9 @@ static void usage(int showDetail){
 ** error message if it is initialized.
 */
 static void verify_uninitialized(void){
+#if defined(EMCC)
+  return;
+#endif
   if( sqlite3_config(-1)==SQLITE_MISUSE ){
     utf8_printf(stdout, "WARNING: attempt to configure SQLite after"
                         " initialization.\n");
@@ -19287,7 +19303,7 @@ static void main_init(ShellState *data) {
   memcpy(data->rowSeparator,SEP_Row, 2);
   data->showHeader = 0;
   data->shellFlgs = SHFLG_Lookaside;
-  //verify_uninitialized();
+  verify_uninitialized();
   sqlite3_config(SQLITE_CONFIG_URI, 1);
   sqlite3_config(SQLITE_CONFIG_LOG, shellLog, data);
   sqlite3_config(SQLITE_CONFIG_MULTITHREAD);
@@ -19344,7 +19360,6 @@ static char *cmdline_option_value(int argc, char **argv, int i){
 int SQLITE_CDECL main(int argc, char **argv){
 #else
 int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
-
   char **argv;
 #endif
   char *zErrMsg = 0;
@@ -19435,11 +19450,11 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
   /* Make sure we have a valid signal handler early, before anything
   ** else is done.
   */
-// #ifdef SIGINT
-//   signal(SIGINT, interrupt_handler);
-// #elif (defined(_WIN32) || defined(WIN32)) && !defined(_WIN32_WCE)
-//   SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
-// #endif
+#ifdef SIGINT
+  signal(SIGINT, interrupt_handler);
+#elif (defined(_WIN32) || defined(WIN32)) && !defined(_WIN32_WCE)
+  SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
+#endif
 
 #ifdef SQLITE_SHELL_DBNAME_PROC
   {
@@ -19458,7 +19473,7 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
   ** the size of the alternative malloc heap,
   ** and the first command to execute.
   */
-  //verify_uninitialized();
+  verify_uninitialized();
   for(i=1; i<argc; i++){
     char *z;
     z = argv[i];
@@ -19571,7 +19586,7 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
       sqlite3MemTraceActivate(stderr);
     }
   }
- //verify_uninitialized();
+ verify_uninitialized();
 
 
 #ifdef SQLITE_SHELL_INIT_PROC
@@ -19616,11 +19631,9 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
   ** files from being created if a user mistypes the database name argument
   ** to the sqlite command-line tool.
   */
-  
   if( access(data.zDbFilename, 0)==0 ){
     open_db(&data, 0);
   }
-  // sqlite3_extension_init(data.db, NULL, NULL);
 
   /* Process the initialization file if there is one.  If no -init option
   ** is given on the command line, look for a file named ~/.sqliterc and
