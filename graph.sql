@@ -35,7 +35,7 @@ INSERT INTO f(
 )
 SELECT 1,    'y = x',                      'blue',   x, x                              FROM x UNION ALL
 SELECT 1,    'y = x^3',                    'green',  x, power(x,3)                     FROM x UNION ALL
-SELECT 1,    'y = sin(5*x+t*π/30)*cos(x)', 'red',    x, sin(5*x+$timer*Pi()/30)*cos(x) FROM x UNION ALL
+SELECT 1,    'y = sin(5*x+t*π)*cos(x)',    'red',    x, sin(5*x+$timer*Pi())*cos(x)    FROM x UNION ALL
 SELECT 0,    'y = cos(5x)',                'purple', x, cos(5*x)                       FROM x;
 -------------------------------------------------------
 --
@@ -66,7 +66,7 @@ SELECT IIF($ticks, printf('<line x1="%s" y1="%s" x2="%s" y2="%s" stroke="black" 
    AND ($ticks OR $tick_labels);
 
 -- Draw functions
-SELECT printf('<text x="%s" y="%s" style="font: bold 13px sans-serif; fill: %s;">%s</text>', $min_x*$scale+10, -$max_y*$scale+20, 'black', 't = ' || $timer)
+SELECT printf('<text x="%s" y="%s" style="font: bold 13px sans-serif; fill: %s;">%s</text>', $min_x*$scale+10, -$max_y*$scale+20, 'black', 't = ' || Round($timer, 1))
  WHERE $function_labels;
 
 WITH f_min_rowid AS (

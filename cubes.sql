@@ -14,9 +14,9 @@
 
 CREATE TABLE vars AS
 SELECT 2 scale,
-       pi()*$timer/200 a,
-       pi()*$timer/200 b,
-       2*pi()*$timer/200 c,
+       $timer/2 a,
+       $timer/2 b,
+       $timer c,
        20 fl;
 
 CREATE TABLE pts(x REAL, y REAL, z REAL);
@@ -75,11 +75,7 @@ SELECT printf('<path d="%s" stroke-width="1" stroke="black" fill="%s" fill-opaci
                              WHEN 1 THEN 'M'
                              ELSE 'L'
                            END
-                        || printf('%s %s', x*$scale, -y*$scale)
-                        || CASE vertex_id
-                             WHEN 4 THEN ' Z'
-                             ELSE ''
-                           END, ' '),
+                        || printf('%s %s', x*$scale, -y*$scale), ' '),
                colour)
   FROM (SELECT fp.fill_id,
                b.x,

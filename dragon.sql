@@ -64,7 +64,7 @@ INSERT INTO path
 SELECT x*$scale, (y-$size)*$scale
   FROM p
  WHERE n <> 1
- LIMIT 10*($timer%500);
+ LIMIT 10*(($timer*100)%(power(2, $iterations-3)+100));
 
 --
 -- OUTPUT

@@ -19450,7 +19450,7 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
   /* Make sure we have a valid signal handler early, before anything
   ** else is done.
   */
-#ifdef SIGINT
+#if defined(SIGINT) && !defined(EMCC)
   signal(SIGINT, interrupt_handler);
 #elif (defined(_WIN32) || defined(WIN32)) && !defined(_WIN32_WCE)
   SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);

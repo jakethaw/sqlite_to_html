@@ -113,7 +113,7 @@ UNION ALL
 SELECT x3, y3, id, 3
   FROM cutout
 ORDER BY 3, 4
-LIMIT 3*($timer%(power(2.8, $depth)));
+LIMIT 3*(($timer*50)%(power(2.8, $depth)));
 
 --
 -- OUTPUT

@@ -12,9 +12,9 @@ emcc \
   -DSQLITE_ENABLE_GEOPOLY \
   -DSQLITE_CORE \
   -DEMCC \
-  -s ASSERTIONS=1 \
+  -USIGINT \
   -s EXPORTED_FUNCTIONS='["_main"]' \
-  -s AGGRESSIVE_VARIABLE_ELIMINATION=1
-
+  -s AGGRESSIVE_VARIABLE_ELIMINATION=1 \
+  -s ASSERTIONS=1
   # -g4 \
   # --source-map-base "http://127.0.0.1:8000/"

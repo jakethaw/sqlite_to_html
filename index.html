@@ -20,7 +20,7 @@
     </p>
     
     <p>
-      <select name="file" id="file" onchange="select_file()">
+      <select id="file" onchange="select_file()">
         <option value="graph.sql">graph.sql</option>
         <option value="affine.sql">affine.sql</option>
         <option value="dragon.sql">dragon.sql</option>
@@ -44,42 +44,55 @@
 
     <script async>
 
-      let timer = 0;
-      let file = document.getElementById("file").value;
-      let eval_wait = 0;
+      let error;
+      let start_timestamp = null;
+      let last_frame_timestamp = null;
+      const file_element = document.getElementById("file");
+      let file;
+      let fps;
 
       // https://emscripten.org/docs/api_reference/module.html
       var Module = {
-        'onRuntimeInitialized': async function() { 
+        'onRuntimeInitialized': async function() {
           await select_file();
-          // Evaluate every 30ms
-          setInterval(eval_sql, 30); 
+          requestAnimationFrame(eval_sql); 
         },
         'noInitialRun': true,
-        'printErr': function(text) { document.getElementById("error").innerText += text + '\n'; }
+        'printErr': function(e){ error += e + '\n'; }
       };
 
       // Run content of textarea in SQLite CLI
-      function eval_sql(){
-        if( eval_wait == 0 ){
-          eval_wait = 1;
+      function eval_sql(timestamp){
+
+        // First execution only
+        if (!start_timestamp) {
+          start_timestamp = timestamp;
+          last_frame_timestamp = timestamp;
+        }
+
+        // If the reqired time has passed, then execute sql in textarea
+        if(timestamp > last_frame_timestamp + (1000.0 / 31) ){
+          last_frame_timestamp = timestamp;
           const sql = document.getElementById("sql").value;
           FS.writeFile(file, sql);
-          document.getElementById("error").innerText = '';
+          error = '';
           sqlite_main([
             ':memory:',
             '.param init',
-            `.param set $timer ${timer}`,
+            `.param set $timer ${(timestamp - start_timestamp)/1000.0}`,
             `.read ${file}`
           ]);
-          document.getElementById('svg').innerHTML = FS.readFile('output.svg', { encoding: 'utf8' });
-          eval_wait = 0;
+          if( document.getElementById("error").innerText != error )
+            document.getElementById("error").innerText = error;
+          try {
+            document.getElementById('svg').innerHTML = FS.readFile('output.svg', { encoding: 'utf8' });
+          } catch {}
         }
-        timer += 1;
+        requestAnimationFrame(eval_sql);
       }
 
       // Call SQLite shell main function
-      function sqlite_main(args){
+      async function sqlite_main(args){
           let argc = args.length+1;
           let argv = _malloc((argc + 1) * 4);
           HEAP32[argv >> 2] = allocateUTF8(thisProgram);
@@ -99,8 +112,7 @@
 
       async function select_file(){
         try {
-          let e = document.getElementById("file");
-          file = e.options[e.selectedIndex].value;
+          file = file_element.options[file_element.selectedIndex].value;
           timer = 0;
 
           // Get file
@@ -112,6 +124,9 @@
             });
 
         } catch(e) { console.log(e); }
+      }
+      function select_fps(){
+        fps = fps_element.options[fps_element.selectedIndex].value;
       }
     </script>
     <script async type="text/javascript" src="sqlite3.js"></script>

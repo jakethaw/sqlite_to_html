@@ -23,9 +23,9 @@ CREATE TEMPORARY TABLE path (
 
 WITH
 v(n,x,y,x_scale,y_scale,rotate) AS (
-SELECT 1, 0, 2*$scale, 1, 1, -$timer*Pi()/250
+SELECT 1, 0, 2*$scale, 1, 1, -$timer/3
 UNION ALL
-SELECT n+1, 0, 2*$scale, 0.97, 0.97, CASE WHEN n%7 IN (0) THEN -1 ELSE 1 END * -$timer*Pi()/250
+SELECT n+1, 0, 2*$scale, 0.97, 0.97, CASE WHEN n%7 IN (0) THEN -1 ELSE 1 END * -$timer/3
   FROM v
  LIMIT 50
 ),
