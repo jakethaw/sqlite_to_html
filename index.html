@@ -49,7 +49,6 @@
       let last_frame_timestamp = null;
       const file_element = document.getElementById("file");
       let file;
-      let fps;
 
       // https://emscripten.org/docs/api_reference/module.html
       var Module = {
@@ -124,9 +123,6 @@
             });
 
         } catch(e) { console.log(e); }
-      }
-      function select_fps(){
-        fps = fps_element.options[fps_element.selectedIndex].value;
       }
     </script>
     <script async type="text/javascript" src="sqlite3.js"></script>
