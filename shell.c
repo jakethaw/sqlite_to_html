@@ -953,7 +953,7 @@ static void shellModuleSchema(
 **    CREATE VIRTUAL TABLE
 **
 ** This UDF is used by the .schema command to insert the schema name of
-** attached databases into the middle of the sqlite_master.sql field.
+** attached databases into the middle of the sqlite_schema.sql field.
 */
 static void shellAddSchemaName(
   sqlite3_context *pCtx,
@@ -3330,7 +3330,7 @@ static int completionNext(sqlite3_vtab_cursor *cur){
             const char *zDb = (const char*)sqlite3_column_text(pS2, 1);
             zSql = sqlite3_mprintf(
                "%z%s"
-               "SELECT name FROM \"%w\".sqlite_master",
+               "SELECT name FROM \"%w\".sqlite_schema",
                zSql, zSep, zDb
             );
             if( zSql==0 ) return SQLITE_NOMEM;
@@ -3354,7 +3354,7 @@ static int completionNext(sqlite3_vtab_cursor *cur){
             const char *zDb = (const char*)sqlite3_column_text(pS2, 1);
             zSql = sqlite3_mprintf(
                "%z%s"
-               "SELECT pti.name FROM \"%w\".sqlite_master AS sm"
+               "SELECT pti.name FROM \"%w\".sqlite_schema AS sm"
                        " JOIN pragma_table_info(sm.name,%Q) AS pti"
                " WHERE sm.type='table'",
                zSql, zSep, zDb, zDb
@@ -4379,6 +4379,904 @@ int sqlite3_uint_init(
 }
 
 /************************* End ../ext/misc/uint.c ********************/
+/************************* Begin ../ext/misc/decimal.c ******************/
+/*
+** 2020-06-22
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+******************************************************************************
+**
+** Routines to implement arbitrary-precision decimal math.
+**
+** The focus here is on simplicity and correctness, not performance.
+*/
+/* #include "sqlite3ext.h" */
+SQLITE_EXTENSION_INIT1
+#include <assert.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdlib.h>
+
+
+/* A decimal object */
+typedef struct Decimal Decimal;
+struct Decimal {
+  char sign;        /* 0 for positive, 1 for negative */
+  char oom;         /* True if an OOM is encountered */
+  char isNull;      /* True if holds a NULL rather than a number */
+  char isInit;      /* True upon initialization */
+  int nDigit;       /* Total number of digits */
+  int nFrac;        /* Number of digits to the right of the decimal point */
+  signed char *a;   /* Array of digits.  Most significant first. */
+};
+
+/*
+** Release memory held by a Decimal, but do not free the object itself.
+*/
+static void decimal_clear(Decimal *p){
+  sqlite3_free(p->a);
+}
+
+/*
+** Destroy a Decimal object
+*/
+static void decimal_free(Decimal *p){
+  if( p ){
+    decimal_clear(p);
+    sqlite3_free(p);
+  }
+}
+
+/*
+** Allocate a new Decimal object.  Initialize it to the number given
+** by the input string.
+*/
+static Decimal *decimal_new(
+  sqlite3_context *pCtx,
+  sqlite3_value *pIn,
+  int nAlt,
+  const unsigned char *zAlt
+){
+  Decimal *p;
+  int n, i;
+  const unsigned char *zIn;
+  int iExp = 0;
+  p = sqlite3_malloc( sizeof(*p) );
+  if( p==0 ) goto new_no_mem;
+  p->sign = 0;
+  p->oom = 0;
+  p->isInit = 1;
+  p->isNull = 0;
+  p->nDigit = 0;
+  p->nFrac = 0;
+  if( zAlt ){
+    n = nAlt,
+    zIn = zAlt;
+  }else{
+    if( sqlite3_value_type(pIn)==SQLITE_NULL ){
+      p->a = 0;
+      p->isNull = 1;
+      return p;
+    }
+    n = sqlite3_value_bytes(pIn);
+    zIn = sqlite3_value_text(pIn);
+  }
+  p->a = sqlite3_malloc64( n+1 );
+  if( p->a==0 ) goto new_no_mem;
+  for(i=0; isspace(zIn[i]); i++){}
+  if( zIn[i]=='-' ){
+    p->sign = 1;
+    i++;
+  }else if( zIn[i]=='+' ){
+    i++;
+  }
+  while( i<n && zIn[i]=='0' ) i++;
+  while( i<n ){
+    char c = zIn[i];
+    if( c>='0' && c<='9' ){
+      p->a[p->nDigit++] = c - '0';
+    }else if( c=='.' ){
+      p->nFrac = p->nDigit + 1;
+    }else if( c=='e' || c=='E' ){
+      int j = i+1;
+      int neg = 0;
+      if( j>=n ) break;
+      if( zIn[j]=='-' ){
+        neg = 1;
+        j++;
+      }else if( zIn[j]=='+' ){
+        j++;
+      }
+      while( j<n && iExp<1000000 ){
+        if( zIn[j]>='0' && zIn[j]<='9' ){
+          iExp = iExp*10 + zIn[j] - '0';
+        }
+        j++;
+      }
+      if( neg ) iExp = -iExp;
+      break;
+    }
+    i++;
+  }
+  if( p->nFrac ){
+    p->nFrac = p->nDigit - (p->nFrac - 1);
+  }
+  if( iExp>0 ){
+    if( p->nFrac>0 ){
+      if( iExp<=p->nFrac ){
+        p->nFrac -= iExp;
+        iExp = 0;
+      }else{
+        iExp -= p->nFrac;
+        p->nFrac = 0;
+      }
+    }
+    if( iExp>0 ){   
+      p->a = sqlite3_realloc64(p->a, p->nDigit + iExp + 1 );
+      if( p->a==0 ) goto new_no_mem;
+      memset(p->a+p->nDigit, 0, iExp);
+      p->nDigit += iExp;
+    }
+  }else if( iExp<0 ){
+    int nExtra;
+    iExp = -iExp;
+    nExtra = p->nDigit - p->nFrac - 1;
+    if( nExtra ){
+      if( nExtra>=iExp ){
+        p->nFrac += iExp;
+        iExp  = 0;
+      }else{
+        iExp -= nExtra;
+        p->nFrac = p->nDigit - 1;
+      }
+    }
+    if( iExp>0 ){
+      p->a = sqlite3_realloc64(p->a, p->nDigit + iExp + 1 );
+      if( p->a==0 ) goto new_no_mem;
+      memmove(p->a+iExp, p->a, p->nDigit);
+      memset(p->a, 0, iExp);
+      p->nDigit += iExp;
+      p->nFrac += iExp;
+    }
+  }
+  return p;
+
+new_no_mem:
+  if( pCtx ) sqlite3_result_error_nomem(pCtx);
+  sqlite3_free(p);
+  return 0;
+}
+
+/*
+** Make the given Decimal the result.
+*/
+static void decimal_result(sqlite3_context *pCtx, Decimal *p){
+  char *z;
+  int i, j;
+  int n;
+  if( p==0 || p->oom ){
+    sqlite3_result_error_nomem(pCtx);
+    return;
+  }
+  if( p->isNull ){
+    sqlite3_result_null(pCtx);
+    return;
+  }
+  z = sqlite3_malloc( p->nDigit+4 );
+  if( z==0 ){
+    sqlite3_result_error_nomem(pCtx);
+    return;
+  }
+  i = 0;
+  if( p->nDigit==0 || (p->nDigit==1 && p->a[0]==0) ){
+    p->sign = 0;
+  }
+  if( p->sign ){
+    z[0] = '-';
+    i = 1;
+  }
+  n = p->nDigit - p->nFrac;
+  if( n<=0 ){
+    z[i++] = '0';
+  }
+  j = 0;
+  while( n>1 && p->a[j]==0 ){
+    j++;
+    n--;
+  }
+  while( n>0  ){
+    z[i++] = p->a[j] + '0';
+    j++;
+    n--;
+  }
+  if( p->nFrac ){
+    z[i++] = '.';
+    do{
+      z[i++] = p->a[j] + '0';
+      j++;
+    }while( j<p->nDigit );
+  }
+  z[i] = 0;
+  sqlite3_result_text(pCtx, z, i, sqlite3_free);
+}
+
+/*
+** SQL Function:   decimal(X)
+**
+** Convert input X into decimal and then back into text
+*/
+static void decimalFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  Decimal *p = decimal_new(context, argv[0], 0, 0);
+  decimal_result(context, p);
+  decimal_free(p);
+}
+
+/*
+** Compare to Decimal objects.  Return negative, 0, or positive if the
+** first object is less than, equal to, or greater than the second.
+**
+** Preconditions for this routine:
+**
+**    pA!=0
+**    pA->isNull==0
+**    pB!=0
+**    pB->isNull==0
+*/
+static int decimal_cmp(const Decimal *pA, const Decimal *pB){
+  int nASig, nBSig, rc, n;
+  if( pA->sign!=pB->sign ){
+    return pA->sign ? -1 : +1;
+  }
+  if( pA->sign ){
+    const Decimal *pTemp = pA;
+    pA = pB;
+    pB = pTemp;
+  }
+  nASig = pA->nDigit - pA->nFrac;
+  nBSig = pB->nDigit - pB->nFrac;
+  if( nASig!=nBSig ){
+    return nASig - nBSig;
+  }
+  n = pA->nDigit;
+  if( n>pB->nDigit ) n = pB->nDigit;
+  rc = memcmp(pA->a, pB->a, n);
+  if( rc==0 ){
+    rc = pA->nDigit - pB->nDigit;
+  }
+  return rc;
+}
+
+/*
+** SQL Function:   decimal_cmp(X, Y)
+**
+** Return negative, zero, or positive if X is less then, equal to, or
+** greater than Y.
+*/
+static void decimalCmpFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  Decimal *pA = 0, *pB = 0;
+  int rc;
+
+  pA = decimal_new(context, argv[0], 0, 0);
+  if( pA==0 || pA->isNull ) goto cmp_done;
+  pB = decimal_new(context, argv[1], 0, 0);
+  if( pB==0 || pB->isNull ) goto cmp_done;
+  rc = decimal_cmp(pA, pB);
+  if( rc<0 ) rc = -1;
+  else if( rc>0 ) rc = +1;
+  sqlite3_result_int(context, rc);
+cmp_done:
+  decimal_free(pA);
+  decimal_free(pB);
+}
+
+/*
+** Expand the Decimal so that it has a least nDigit digits and nFrac
+** digits to the right of the decimal point.
+*/
+static void decimal_expand(Decimal *p, int nDigit, int nFrac){
+  int nAddSig;
+  int nAddFrac;
+  if( p==0 ) return;
+  nAddFrac = nFrac - p->nFrac;
+  nAddSig = (nDigit - p->nDigit) - nAddFrac;
+  if( nAddFrac==0 && nAddSig==0 ) return;
+  p->a = sqlite3_realloc64(p->a, nDigit+1);
+  if( p->a==0 ){
+    p->oom = 1;
+    return;
+  }
+  if( nAddSig ){
+    memmove(p->a+nAddSig, p->a, p->nDigit);
+    memset(p->a, 0, nAddSig);
+    p->nDigit += nAddSig;
+  }
+  if( nAddFrac ){
+    memset(p->a+p->nDigit, 0, nAddFrac);
+    p->nDigit += nAddFrac;
+    p->nFrac += nAddFrac;
+  }
+}
+
+/*
+** Add the value pB into pA.
+**
+** Both pA and pB might become denormalized by this routine.
+*/
+static void decimal_add(Decimal *pA, Decimal *pB){
+  int nSig, nFrac, nDigit;
+  int i, rc;
+  if( pA==0 ){
+    return;
+  }
+  if( pA->oom || pB==0 || pB->oom ){
+    pA->oom = 1;
+    return;
+  }
+  if( pA->isNull || pB->isNull ){
+    pA->isNull = 1;
+    return;
+  }
+  nSig = pA->nDigit - pA->nFrac;
+  if( nSig && pA->a[0]==0 ) nSig--;
+  if( nSig<pB->nDigit-pB->nFrac ){
+    nSig = pB->nDigit - pB->nFrac;
+  }
+  nFrac = pA->nFrac;
+  if( nFrac<pB->nFrac ) nFrac = pB->nFrac;
+  nDigit = nSig + nFrac + 1;
+  decimal_expand(pA, nDigit, nFrac);
+  decimal_expand(pB, nDigit, nFrac);
+  if( pA->oom || pB->oom ){
+    pA->oom = 1;
+  }else{
+    if( pA->sign==pB->sign ){
+      int carry = 0;
+      for(i=nDigit-1; i>=0; i--){
+        int x = pA->a[i] + pB->a[i] + carry;
+        if( x>=10 ){
+          carry = 1;
+          pA->a[i] = x - 10;
+        }else{
+          carry = 0;
+          pA->a[i] = x;
+        }
+      }
+    }else{
+      signed char *aA, *aB;
+      int borrow = 0;
+      rc = memcmp(pA->a, pB->a, nDigit);
+      if( rc<0 ){
+        aA = pB->a;
+        aB = pA->a;
+        pA->sign = !pA->sign;
+      }else{
+        aA = pA->a;
+        aB = pB->a;
+      }
+      for(i=nDigit-1; i>=0; i--){
+        int x = aA[i] - aB[i] - borrow;
+        if( x<0 ){
+          pA->a[i] = x+10;
+          borrow = 1;
+        }else{
+          pA->a[i] = x;
+          borrow = 0;
+        }
+      }
+    }
+  }
+}
+
+/*
+** Compare text in decimal order.
+*/
+static int decimalCollFunc(
+  void *notUsed,
+  int nKey1, const void *pKey1,
+  int nKey2, const void *pKey2
+){
+  const unsigned char *zA = (const unsigned char*)pKey1;
+  const unsigned char *zB = (const unsigned char*)pKey2;
+  Decimal *pA = decimal_new(0, 0, nKey1, zA);
+  Decimal *pB = decimal_new(0, 0, nKey2, zB);
+  int rc;
+  if( pA==0 || pB==0 ){
+    rc = 0;
+  }else{
+    rc = decimal_cmp(pA, pB);
+  }
+  decimal_free(pA);
+  decimal_free(pB);
+  return rc;
+}
+
+
+/*
+** SQL Function:   decimal_add(X, Y)
+**                 decimal_sub(X, Y)
+**
+** Return the sum or difference of X and Y.
+*/
+static void decimalAddFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  Decimal *pA = decimal_new(context, argv[0], 0, 0);
+  Decimal *pB = decimal_new(context, argv[1], 0, 0);
+  decimal_add(pA, pB);
+  decimal_result(context, pA);
+  decimal_free(pA);
+  decimal_free(pB);
+}
+static void decimalSubFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  Decimal *pA = decimal_new(context, argv[0], 0, 0);
+  Decimal *pB = decimal_new(context, argv[1], 0, 0);
+  if( pB==0 ) return;
+  pB->sign = !pB->sign;
+  decimal_add(pA, pB);
+  decimal_result(context, pA);
+  decimal_free(pA);
+  decimal_free(pB);
+}
+
+/* Aggregate funcion:   decimal_sum(X)
+**
+** Works like sum() except that it uses decimal arithmetic for unlimited
+** precision.
+*/
+static void decimalSumStep(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  Decimal *p;
+  Decimal *pArg;
+  p = sqlite3_aggregate_context(context, sizeof(*p));
+  if( p==0 ) return;
+  if( !p->isInit ){
+    p->isInit = 1;
+    p->a = sqlite3_malloc(2);
+    if( p->a==0 ){
+      p->oom = 1;
+    }else{
+      p->a[0] = 0;
+    }
+    p->nDigit = 1;
+    p->nFrac = 0;
+  }
+  if( sqlite3_value_type(argv[0])==SQLITE_NULL ) return;
+  pArg = decimal_new(context, argv[0], 0, 0);
+  decimal_add(p, pArg);
+  decimal_free(pArg);
+}
+static void decimalSumInverse(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  Decimal *p;
+  Decimal *pArg;
+  p = sqlite3_aggregate_context(context, sizeof(*p));
+  if( p==0 ) return;
+  if( sqlite3_value_type(argv[0])==SQLITE_NULL ) return;
+  pArg = decimal_new(context, argv[0], 0, 0);
+  if( pArg ) pArg->sign = !pArg->sign;
+  decimal_add(p, pArg);
+  decimal_free(pArg);
+}
+static void decimalSumValue(sqlite3_context *context){
+  Decimal *p = sqlite3_aggregate_context(context, 0);
+  if( p==0 ) return;
+  decimal_result(context, p);
+}
+static void decimalSumFinalize(sqlite3_context *context){
+  Decimal *p = sqlite3_aggregate_context(context, 0);
+  if( p==0 ) return;
+  decimal_result(context, p);
+  decimal_clear(p);
+}
+
+/*
+** SQL Function:   decimal_mul(X, Y)
+**
+** Return the product of X and Y.
+**
+** All significant digits after the decimal point are retained.
+** Trailing zeros after the decimal point are omitted as long as
+** the number of digits after the decimal point is no less than
+** either the number of digits in either input.
+*/
+static void decimalMulFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  Decimal *pA = decimal_new(context, argv[0], 0, 0);
+  Decimal *pB = decimal_new(context, argv[1], 0, 0);
+  signed char *acc = 0;
+  int i, j, k;
+  int minFrac;
+  if( pA==0 || pA->oom || pA->isNull
+   || pB==0 || pB->oom || pB->isNull 
+  ){
+    goto mul_end;
+  }
+  acc = sqlite3_malloc64( pA->nDigit + pB->nDigit + 2 );
+  if( acc==0 ){
+    sqlite3_result_error_nomem(context);
+    goto mul_end;
+  }
+  memset(acc, 0, pA->nDigit + pB->nDigit + 2);
+  minFrac = pA->nFrac;
+  if( pB->nFrac<minFrac ) minFrac = pB->nFrac;
+  for(i=pA->nDigit-1; i>=0; i--){
+    signed char f = pA->a[i];
+    int carry = 0, x;
+    for(j=pB->nDigit-1, k=i+j+3; j>=0; j--, k--){
+      x = acc[k] + f*pB->a[j] + carry;
+      acc[k] = x%10;
+      carry = x/10;
+    }
+    x = acc[k] + carry;
+    acc[k] = x%10;
+    acc[k-1] += x/10;
+  }
+  sqlite3_free(pA->a);
+  pA->a = acc;
+  acc = 0;
+  pA->nDigit += pB->nDigit + 2;
+  pA->nFrac += pB->nFrac;
+  pA->sign ^= pB->sign;
+  while( pA->nFrac>minFrac && pA->a[pA->nDigit-1]==0 ){
+    pA->nFrac--;
+    pA->nDigit--;
+  }
+  decimal_result(context, pA);
+
+mul_end:
+  sqlite3_free(acc);
+  decimal_free(pA);
+  decimal_free(pB);
+}
+
+#ifdef _WIN32
+
+#endif
+int sqlite3_decimal_init(
+  sqlite3 *db, 
+  char **pzErrMsg, 
+  const sqlite3_api_routines *pApi
+){
+  int rc = SQLITE_OK;
+  SQLITE_EXTENSION_INIT2(pApi);
+  static const struct {
+    const char *zFuncName;
+    int nArg;
+    void (*xFunc)(sqlite3_context*,int,sqlite3_value**);
+  } aFunc[] = {
+    { "decimal",       1,   decimalFunc        },
+    { "decimal_cmp",   2,   decimalCmpFunc     },
+    { "decimal_add",   2,   decimalAddFunc     },
+    { "decimal_sub",   2,   decimalSubFunc     },
+    { "decimal_mul",   2,   decimalMulFunc     },
+  };
+  int i;
+  (void)pzErrMsg;  /* Unused parameter */
+
+  for(i=0; i<sizeof(aFunc)/sizeof(aFunc[0]) && rc==SQLITE_OK; i++){
+    rc = sqlite3_create_function(db, aFunc[i].zFuncName, aFunc[i].nArg,
+                   SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC,
+                   0, aFunc[i].xFunc, 0, 0);
+  }
+  if( rc==SQLITE_OK ){
+    rc = sqlite3_create_window_function(db, "decimal_sum", 1,
+                   SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_DETERMINISTIC, 0,
+                   decimalSumStep, decimalSumFinalize,
+                   decimalSumValue, decimalSumInverse, 0);
+  }
+  if( rc==SQLITE_OK ){
+    rc = sqlite3_create_collation(db, "decimal", SQLITE_UTF8,
+                                  0, decimalCollFunc);
+  }
+  return rc;
+}
+
+/************************* End ../ext/misc/decimal.c ********************/
+/************************* Begin ../ext/misc/ieee754.c ******************/
+/*
+** 2013-04-17
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+******************************************************************************
+**
+** This SQLite extension implements functions for the exact display
+** and input of IEEE754 Binary64 floating-point numbers.
+**
+**   ieee754(X)
+**   ieee754(Y,Z)
+**
+** In the first form, the value X should be a floating-point number.
+** The function will return a string of the form 'ieee754(Y,Z)' where
+** Y and Z are integers such that X==Y*pow(2,Z).
+**
+** In the second form, Y and Z are integers which are the mantissa and
+** base-2 exponent of a new floating point number.  The function returns
+** a floating-point value equal to Y*pow(2,Z).
+**
+** Examples:
+**
+**     ieee754(2.0)             ->     'ieee754(2,0)'
+**     ieee754(45.25)           ->     'ieee754(181,-2)'
+**     ieee754(2, 0)            ->     2.0
+**     ieee754(181, -2)         ->     45.25
+**
+** Two additional functions break apart the one-argument ieee754()
+** result into separate integer values:
+**
+**     ieee754_mantissa(45.25)  ->     181
+**     ieee754_exponent(45.25)  ->     -2
+**
+** These functions convert binary64 numbers into blobs and back again.
+**
+**     ieee754_from_blob(x'3ff0000000000000')  ->  1.0
+**     ieee754_to_blob(1.0)                    ->  x'3ff0000000000000'
+**
+** In all single-argument functions, if the argument is an 8-byte blob
+** then that blob is interpreted as a big-endian binary64 value.
+**
+**
+** EXACT DECIMAL REPRESENTATION OF BINARY64 VALUES
+** -----------------------------------------------
+**
+** This extension in combination with the separate 'decimal' extension
+** can be used to compute the exact decimal representation of binary64
+** values.  To begin, first compute a table of exponent values:
+**
+**    CREATE TABLE pow2(x INTEGER PRIMARY KEY, v TEXT);
+**    WITH RECURSIVE c(x,v) AS (
+**      VALUES(0,'1')
+**      UNION ALL
+**      SELECT x+1, decimal_mul(v,'2') FROM c WHERE x+1<=971
+**    ) INSERT INTO pow2(x,v) SELECT x, v FROM c;
+**    WITH RECURSIVE c(x,v) AS (
+**      VALUES(-1,'0.5')
+**      UNION ALL
+**      SELECT x-1, decimal_mul(v,'0.5') FROM c WHERE x-1>=-1075
+**    ) INSERT INTO pow2(x,v) SELECT x, v FROM c;
+**
+** Then, to compute the exact decimal representation of a floating
+** point value (the value 47.49 is used in the example) do:
+**
+**    WITH c(n) AS (VALUES(47.49))
+**          ---------------^^^^^---- Replace with whatever you want
+**    SELECT decimal_mul(ieee754_mantissa(c.n),pow2.v)
+**      FROM pow2, c WHERE pow2.x=ieee754_exponent(c.n);
+**
+** Here is a query to show various boundry values for the binary64
+** number format:
+**
+**    WITH c(name,bin) AS (VALUES
+**       ('minimum positive value',        x'0000000000000001'),
+**       ('maximum subnormal value',       x'000fffffffffffff'),
+**       ('mininum positive nornal value', x'0010000000000000'),
+**       ('maximum value',                 x'7fefffffffffffff'))
+**    SELECT c.name, decimal_mul(ieee754_mantissa(c.bin),pow2.v)
+**      FROM pow2, c WHERE pow2.x=ieee754_exponent(c.bin);
+**
+*/
+/* #include "sqlite3ext.h" */
+SQLITE_EXTENSION_INIT1
+#include <assert.h>
+#include <string.h>
+
+/*
+** Implementation of the ieee754() function
+*/
+static void ieee754func(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  if( argc==1 ){
+    sqlite3_int64 m, a;
+    double r;
+    int e;
+    int isNeg;
+    char zResult[100];
+    assert( sizeof(m)==sizeof(r) );
+    if( sqlite3_value_type(argv[0])==SQLITE_BLOB
+     && sqlite3_value_bytes(argv[0])==sizeof(r)
+    ){
+      const unsigned char *x = sqlite3_value_blob(argv[0]);
+      int i;
+      sqlite3_uint64 v = 0;
+      for(i=0; i<sizeof(r); i++){
+        v = (v<<8) | x[i];
+      }
+      memcpy(&r, &v, sizeof(r));
+    }else{
+      r = sqlite3_value_double(argv[0]);
+    }
+    if( r<0.0 ){
+      isNeg = 1;
+      r = -r;
+    }else{
+      isNeg = 0;
+    }
+    memcpy(&a,&r,sizeof(a));
+    if( a==0 ){
+      e = 0;
+      m = 0;
+    }else{
+      e = a>>52;
+      m = a & ((((sqlite3_int64)1)<<52)-1);
+      if( e==0 ){
+        m <<= 1;
+      }else{
+        m |= ((sqlite3_int64)1)<<52;
+      }
+      while( e<1075 && m>0 && (m&1)==0 ){
+        m >>= 1;
+        e++;
+      }
+      if( isNeg ) m = -m;
+    }
+    switch( *(int*)sqlite3_user_data(context) ){
+      case 0:
+        sqlite3_snprintf(sizeof(zResult), zResult, "ieee754(%lld,%d)",
+                         m, e-1075);
+        sqlite3_result_text(context, zResult, -1, SQLITE_TRANSIENT);
+        break;
+      case 1:
+        sqlite3_result_int64(context, m);
+        break;
+      case 2:
+        sqlite3_result_int(context, e-1075);
+        break;
+    }
+  }else{
+    sqlite3_int64 m, e, a;
+    double r;
+    int isNeg = 0;
+    m = sqlite3_value_int64(argv[0]);
+    e = sqlite3_value_int64(argv[1]);
+    if( m<0 ){
+      isNeg = 1;
+      m = -m;
+      if( m<0 ) return;
+    }else if( m==0 && e>-1000 && e<1000 ){
+      sqlite3_result_double(context, 0.0);
+      return;
+    }
+    while( (m>>32)&0xffe00000 ){
+      m >>= 1;
+      e++;
+    }
+    while( m!=0 && ((m>>32)&0xfff00000)==0 ){
+      m <<= 1;
+      e--;
+    }
+    e += 1075;
+    if( e<=0 ){
+      /* Subnormal */
+      m >>= 1-e;
+      e = 0;
+    }else if( e>0x7ff ){
+      e = 0x7ff;
+    }
+    a = m & ((((sqlite3_int64)1)<<52)-1);
+    a |= e<<52;
+    if( isNeg ) a |= ((sqlite3_uint64)1)<<63;
+    memcpy(&r, &a, sizeof(r));
+    sqlite3_result_double(context, r);
+  }
+}
+
+/*
+** Functions to convert between blobs and floats.
+*/
+static void ieee754func_from_blob(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  if( sqlite3_value_type(argv[0])==SQLITE_BLOB
+   && sqlite3_value_bytes(argv[0])==sizeof(double)
+  ){
+    double r;
+    const unsigned char *x = sqlite3_value_blob(argv[0]);
+    int i;
+    sqlite3_uint64 v = 0;
+    for(i=0; i<sizeof(r); i++){
+      v = (v<<8) | x[i];
+    }
+    memcpy(&r, &v, sizeof(r));
+    sqlite3_result_double(context, r);
+  }
+}
+static void ieee754func_to_blob(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  if( sqlite3_value_type(argv[0])==SQLITE_FLOAT
+   || sqlite3_value_type(argv[0])==SQLITE_INTEGER
+  ){
+    double r = sqlite3_value_double(argv[0]);
+    sqlite3_uint64 v;
+    unsigned char a[sizeof(r)];
+    int i;
+    memcpy(&v, &r, sizeof(r));
+    for(i=1; i<=sizeof(r); i++){
+      a[sizeof(r)-i] = v&0xff;
+      v >>= 8;
+    }
+    sqlite3_result_blob(context, a, sizeof(r), SQLITE_TRANSIENT);
+  }
+}
+
+
+#ifdef _WIN32
+
+#endif
+int sqlite3_ieee_init(
+  sqlite3 *db, 
+  char **pzErrMsg, 
+  const sqlite3_api_routines *pApi
+){
+  static const struct {
+    char *zFName;
+    int nArg;
+    int iAux;
+    void (*xFunc)(sqlite3_context*,int,sqlite3_value**);
+  } aFunc[] = {
+    { "ieee754",           1,   0, ieee754func },
+    { "ieee754",           2,   0, ieee754func },
+    { "ieee754_mantissa",  1,   1, ieee754func },
+    { "ieee754_exponent",  1,   2, ieee754func },
+    { "ieee754_to_blob",   1,   0, ieee754func_to_blob },
+    { "ieee754_from_blob", 1,   0, ieee754func_from_blob },
+
+  };
+  int i;
+  int rc = SQLITE_OK;
+  SQLITE_EXTENSION_INIT2(pApi);
+  (void)pzErrMsg;  /* Unused parameter */
+  for(i=0; i<sizeof(aFunc)/sizeof(aFunc[0]) && rc==SQLITE_OK; i++){
+    rc = sqlite3_create_function(db, aFunc[i].zFName, aFunc[i].nArg,	
+                               SQLITE_UTF8|SQLITE_INNOCUOUS,
+                               (void*)&aFunc[i].iAux,
+                               aFunc[i].xFunc, 0, 0);
+  }
+  return rc;
+}
+
+/************************* End ../ext/misc/ieee754.c ********************/
 #ifdef SQLITE_HAVE_ZLIB
 /************************* Begin ../ext/misc/zipfile.c ******************/
 /*
@@ -8096,7 +8994,7 @@ static int idxProcessOneTrigger(
   IdxTable *pTab = pWrite->pTab;
   const char *zTab = pTab->zName;
   const char *zSql = 
-    "SELECT 'CREATE TEMP' || substr(sql, 7) FROM sqlite_master "
+    "SELECT 'CREATE TEMP' || substr(sql, 7) FROM sqlite_schema "
     "WHERE tbl_name = %Q AND type IN ('table', 'trigger') "
     "ORDER BY type;";
   sqlite3_stmt *pSelect = 0;
@@ -8196,12 +9094,12 @@ static int idxCreateVtabSchema(sqlite3expert *p, char **pzErrmsg){
   **   2) Create the equivalent virtual table in dbv.
   */
   rc = idxPrepareStmt(p->db, &pSchema, pzErrmsg,
-      "SELECT type, name, sql, 1 FROM sqlite_master "
+      "SELECT type, name, sql, 1 FROM sqlite_schema "
       "WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%%' "
       " UNION ALL "
-      "SELECT type, name, sql, 2 FROM sqlite_master "
+      "SELECT type, name, sql, 2 FROM sqlite_schema "
       "WHERE type = 'trigger'"
-      "  AND tbl_name IN(SELECT name FROM sqlite_master WHERE type = 'view') "
+      "  AND tbl_name IN(SELECT name FROM sqlite_schema WHERE type = 'view') "
       "ORDER BY 4, 1"
   );
   while( rc==SQLITE_OK && SQLITE_ROW==sqlite3_step(pSchema) ){
@@ -8371,7 +9269,7 @@ static int idxLargestIndex(sqlite3 *db, int *pnMax, char **pzErr){
   int rc = SQLITE_OK;
   const char *zMax = 
     "SELECT max(i.seqno) FROM "
-    "  sqlite_master AS s, "
+    "  sqlite_schema AS s, "
     "  pragma_index_list(s.name) AS l, "
     "  pragma_index_info(l.name) AS i "
     "WHERE s.type = 'table'";
@@ -8524,7 +9422,7 @@ static int idxPopulateStat1(sqlite3expert *p, char **pzErr){
 
   const char *zAllIndex =
     "SELECT s.rowid, s.name, l.name FROM "
-    "  sqlite_master AS s, "
+    "  sqlite_schema AS s, "
     "  pragma_index_list(s.name) AS l "
     "WHERE s.type = 'table'";
   const char *zIndexXInfo = 
@@ -8598,7 +9496,7 @@ static int idxPopulateStat1(sqlite3expert *p, char **pzErr){
   sqlite3_free(pCtx);
 
   if( rc==SQLITE_OK ){
-    rc = sqlite3_exec(p->dbm, "ANALYZE sqlite_master", 0, 0, 0);
+    rc = sqlite3_exec(p->dbm, "ANALYZE sqlite_schema", 0, 0, 0);
   }
 
   sqlite3_exec(p->db, "DROP TABLE IF EXISTS temp."UNIQUE_TABLE_NAME,0,0,0);
@@ -8637,7 +9535,7 @@ sqlite3expert *sqlite3_expert_new(sqlite3 *db, char **pzErrmsg){
   if( rc==SQLITE_OK ){
     sqlite3_stmt *pSql;
     rc = idxPrintfPrepareStmt(pNew->db, &pSql, pzErrmsg, 
-        "SELECT sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%%'"
+        "SELECT sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%%'"
         " AND sql NOT LIKE 'CREATE VIRTUAL %%'"
     );
     while( rc==SQLITE_OK && SQLITE_ROW==sqlite3_step(pSql) ){
@@ -11038,16 +11936,16 @@ static void createSelftestTable(ShellState *p){
     "INSERT INTO [_shell$self]\n"
     "  SELECT 'run',\n"
     "    'SELECT hex(sha3_query(''SELECT type,name,tbl_name,sql "
-                                 "FROM sqlite_master ORDER BY 2'',224))',\n"
+                                 "FROM sqlite_schema ORDER BY 2'',224))',\n"
     "    hex(sha3_query('SELECT type,name,tbl_name,sql "
-                          "FROM sqlite_master ORDER BY 2',224));\n"
+                          "FROM sqlite_schema ORDER BY 2',224));\n"
     "INSERT INTO [_shell$self]\n"
     "  SELECT 'run',"
     "    'SELECT hex(sha3_query(''SELECT * FROM \"' ||"
     "        printf('%w',name) || '\" NOT INDEXED'',224))',\n"
     "    hex(sha3_query(printf('SELECT * FROM \"%w\" NOT INDEXED',name),224))\n"
     "  FROM (\n"
-    "    SELECT name FROM sqlite_master\n"
+    "    SELECT name FROM sqlite_schema\n"
     "     WHERE type='table'\n"
     "       AND name<>'selftest'\n"
     "       AND coalesce(rootpage,0)>0\n"
@@ -12350,7 +13248,7 @@ static int dump_callback(void *pArg, int nArg, char **azArg, char **azNotUsed){
   if( strcmp(zTable, "sqlite_sequence")==0 ){
     raw_printf(p->out, "DELETE FROM sqlite_sequence;\n");
   }else if( sqlite3_strglob("sqlite_stat?", zTable)==0 ){
-    raw_printf(p->out, "ANALYZE sqlite_master;\n");
+    raw_printf(p->out, "ANALYZE sqlite_schema;\n");
   }else if( strncmp(zTable, "sqlite_", 7)==0 ){
     return 0;
   }else if( strncmp(zSql, "CREATE VIRTUAL TABLE", 20)==0 ){
@@ -12360,7 +13258,7 @@ static int dump_callback(void *pArg, int nArg, char **azArg, char **azNotUsed){
       p->writableSchema = 1;
     }
     zIns = sqlite3_mprintf(
-       "INSERT INTO sqlite_master(type,name,tbl_name,rootpage,sql)"
+       "INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql)"
        "VALUES('table','%q','%q',0,'%q');",
        zTable, zTable, zSql);
     utf8_printf(p->out, "%s\n", zIns);
@@ -12675,7 +13573,7 @@ static const char *(azHelp[]) = {
 #endif
   ".sha3sum ...             Compute a SHA3 hash of database content",
   "    Options:",
-  "      --schema              Also hash the sqlite_master table",
+  "      --schema              Also hash the sqlite_schema table",
   "      --sha3-224            Use the sha3-224 algorithm",
   "      --sha3-256            Use the sha3-256 algorithm (default)",
   "      --sha3-384            Use the sha3-384 algorithm",
@@ -13223,6 +14121,8 @@ static void open_db(ShellState *p, int openFlags){
     sqlite3_shathree_init(p->db, 0, 0);
     sqlite3_completion_init(p->db, 0, 0);
     sqlite3_uint_init(p->db, 0, 0);
+    sqlite3_decimal_init(p->db, 0, 0);
+    sqlite3_ieee_init(p->db, 0, 0);
 #if !defined(SQLITE_OMIT_VIRTUALTABLE) && defined(SQLITE_ENABLE_DBPAGE_VTAB)
     sqlite3_dbdata_init(p->db, 0, 0);
 #endif
@@ -13826,7 +14726,7 @@ end_data_xfer:
 ** Try to transfer all rows of the schema that match zWhere.  For
 ** each row, invoke xForEach() on the object defined by that row.
 ** If an error is encountered while moving forward through the
-** sqlite_master table, try again moving backwards.
+** sqlite_schema table, try again moving backwards.
 */
 static void tryToCloneSchema(
   ShellState *p,
@@ -13841,7 +14741,7 @@ static void tryToCloneSchema(
   const unsigned char *zSql;
   char *zErrMsg = 0;
 
-  zQuery = sqlite3_mprintf("SELECT name, sql FROM sqlite_master"
+  zQuery = sqlite3_mprintf("SELECT name, sql FROM sqlite_schema"
                            " WHERE %s", zWhere);
   rc = sqlite3_prepare_v2(p->db, zQuery, -1, &pQuery, 0);
   if( rc ){
@@ -13868,7 +14768,7 @@ static void tryToCloneSchema(
   if( rc!=SQLITE_DONE ){
     sqlite3_finalize(pQuery);
     sqlite3_free(zQuery);
-    zQuery = sqlite3_mprintf("SELECT name, sql FROM sqlite_master"
+    zQuery = sqlite3_mprintf("SELECT name, sql FROM sqlite_schema"
                              " WHERE %s ORDER BY rowid DESC", zWhere);
     rc = sqlite3_prepare_v2(p->db, zQuery, -1, &pQuery, 0);
     if( rc ){
@@ -14072,11 +14972,11 @@ static int shell_dbinfo_command(ShellState *p, int nArg, char **azArg){
     raw_printf(p->out, "\n");
   }
   if( zDb==0 ){
-    zSchemaTab = sqlite3_mprintf("main.sqlite_master");
+    zSchemaTab = sqlite3_mprintf("main.sqlite_schema");
   }else if( strcmp(zDb,"temp")==0 ){
-    zSchemaTab = sqlite3_mprintf("%s", "sqlite_temp_master");
+    zSchemaTab = sqlite3_mprintf("%s", "sqlite_temp_schema");
   }else{
-    zSchemaTab = sqlite3_mprintf("\"%w\".sqlite_master", zDb);
+    zSchemaTab = sqlite3_mprintf("\"%w\".sqlite_schema", zDb);
   }
   for(i=0; i<ArraySize(aQuery); i++){
     char *zSql = sqlite3_mprintf(aQuery[i].zSql, zSchemaTab);
@@ -14398,7 +15298,7 @@ static int lintFkeyIndexes(
     "  || ');'"
     ", "
     "     f.[table] "
-    "FROM sqlite_master AS s, pragma_foreign_key_list(s.name) AS f "
+    "FROM sqlite_schema AS s, pragma_foreign_key_list(s.name) AS f "
     "LEFT JOIN pragma_table_info AS p ON (pk-1=seq AND p.arg=f.[table]) "
     "GROUP BY s.name, f.id "
     "ORDER BY (CASE WHEN ? THEN f.[table] ELSE s.name END)"
@@ -15473,7 +16373,7 @@ static RecoverTable *recoverNewTable(
     shellPreparePrintf(dbtmp, &rc, &pStmt, 
       "SELECT ("
       "  SELECT substr(data,1,1)==X'0D' FROM sqlite_dbpage WHERE pgno=rootpage"
-      ") FROM sqlite_master WHERE name = %Q", zName
+      ") FROM sqlite_schema WHERE name = %Q", zName
     );
     if( rc==SQLITE_OK && SQLITE_ROW==sqlite3_step(pStmt) ){
       bSqlIntkey = sqlite3_column_int(pStmt, 0);
@@ -15545,7 +16445,7 @@ static RecoverTable *recoverNewTable(
 
 /*
 ** This function is called to search the schema recovered from the
-** sqlite_master table of the (possibly) corrupt database as part
+** sqlite_schema table of the (possibly) corrupt database as part
 ** of a ".recover" command. Specifically, for a table with root page
 ** iRoot and at least nCol columns. Additionally, if bIntkey is 0, the
 ** table must be a WITHOUT ROWID table, or if non-zero, not one of
@@ -15808,7 +16708,7 @@ static int recoverDatabaseCmd(ShellState *pState, int nArg, char **azArg){
     ");"
 
     /* Extract data from page 1 and any linked pages into table
-    ** recovery.schema. With the same schema as an sqlite_master table.  */
+    ** recovery.schema. With the same schema as an sqlite_schema table.  */
     "CREATE TABLE recovery.schema(type, name, tbl_name, rootpage, sql);"
     "INSERT INTO recovery.schema SELECT "
     "  max(CASE WHEN field=0 THEN value ELSE NULL END),"
@@ -15960,7 +16860,7 @@ static int recoverDatabaseCmd(ShellState *pState, int nArg, char **azArg){
       if( sqlite3_strnicmp(zSql, "create virt", 11)==0 ){
         const char *zName = (const char*)sqlite3_column_text(pStmt, 1);
         char *zPrint = shellMPrintf(&rc, 
-          "INSERT INTO sqlite_master VALUES('table', %Q, %Q, 0, %Q)",
+          "INSERT INTO sqlite_schema VALUES('table', %Q, %Q, 0, %Q)",
           zName, zName, zSql
         );
         raw_printf(pState->out, "%s;\n", zPrint);
@@ -16332,13 +17232,13 @@ static int do_meta_command(char *zLine, ShellState *p){
     p->writableSchema = 0;
     p->showHeader = 0;
     /* Set writable_schema=ON since doing so forces SQLite to initialize
-    ** as much of the schema as it can even if the sqlite_master table is
+    ** as much of the schema as it can even if the sqlite_schema table is
     ** corrupt. */
     sqlite3_exec(p->db, "SAVEPOINT dump; PRAGMA writable_schema=ON", 0, 0, 0);
     p->nErr = 0;
     if( zLike==0 ) zLike = sqlite3_mprintf("true");
     zSql = sqlite3_mprintf(
-      "SELECT name, type, sql FROM sqlite_master "
+      "SELECT name, type, sql FROM sqlite_schema "
       "WHERE (%s) AND type=='table'"
       "  AND sql NOT NULL"
       " ORDER BY tbl_name='sqlite_sequence', rowid",
@@ -16347,7 +17247,7 @@ static int do_meta_command(char *zLine, ShellState *p){
     run_schema_dump_query(p,zSql);
     sqlite3_free(zSql);
     zSql = sqlite3_mprintf(
-      "SELECT sql FROM sqlite_master "
+      "SELECT sql FROM sqlite_schema "
       "WHERE (%s) AND sql NOT NULL"
       "  AND type IN ('index','trigger','view')",
       zLike
@@ -16394,7 +17294,7 @@ static int do_meta_command(char *zLine, ShellState *p){
         p->autoEQP = AUTOEQP_full;
         p->autoEQPtrace = 1;
         open_db(p, 0);
-        sqlite3_exec(p->db, "SELECT name FROM sqlite_master LIMIT 1", 0, 0, 0);
+        sqlite3_exec(p->db, "SELECT name FROM sqlite_schema LIMIT 1", 0, 0, 0);
         sqlite3_exec(p->db, "PRAGMA vdbe_trace=ON;", 0, 0, 0);
 #endif
       }else{
@@ -16607,8 +17507,8 @@ static int do_meta_command(char *zLine, ShellState *p){
     rc = sqlite3_exec(p->db,
        "SELECT sql FROM"
        "  (SELECT sql sql, type type, tbl_name tbl_name, name name, rowid x"
-       "     FROM sqlite_master UNION ALL"
-       "   SELECT sql, type, tbl_name, name, rowid FROM sqlite_temp_master) "
+       "     FROM sqlite_schema UNION ALL"
+       "   SELECT sql, type, tbl_name, name, rowid FROM sqlite_temp_schema) "
        "WHERE type!='meta' AND sql NOTNULL AND name NOT LIKE 'sqlite_%' "
        "ORDER BY rowid",
        callback, &data, &zErrMsg
@@ -16616,7 +17516,7 @@ static int do_meta_command(char *zLine, ShellState *p){
     if( rc==SQLITE_OK ){
       sqlite3_stmt *pStmt;
       rc = sqlite3_prepare_v2(p->db,
-               "SELECT rowid FROM sqlite_master"
+               "SELECT rowid FROM sqlite_schema"
                " WHERE name GLOB 'sqlite_stat[134]'",
                -1, &pStmt, 0);
       doStats = sqlite3_step(pStmt)==SQLITE_ROW;
@@ -16625,15 +17525,15 @@ static int do_meta_command(char *zLine, ShellState *p){
     if( doStats==0 ){
       raw_printf(p->out, "/* No STAT tables available */\n");
     }else{
-      raw_printf(p->out, "ANALYZE sqlite_master;\n");
-      sqlite3_exec(p->db, "SELECT 'ANALYZE sqlite_master'",
+      raw_printf(p->out, "ANALYZE sqlite_schema;\n");
+      sqlite3_exec(p->db, "SELECT 'ANALYZE sqlite_schema'",
                    callback, &data, &zErrMsg);
       data.cMode = data.mode = MODE_Insert;
       data.zDestTable = "sqlite_stat1";
       shell_exec(&data, "SELECT * FROM sqlite_stat1", &zErrMsg);
       data.zDestTable = "sqlite_stat4";
       shell_exec(&data, "SELECT * FROM sqlite_stat4", &zErrMsg);
-      raw_printf(p->out, "ANALYZE sqlite_master;\n");
+      raw_printf(p->out, "ANALYZE sqlite_schema;\n");
     }
   }else
 
@@ -16799,7 +17699,6 @@ static int do_meta_command(char *zLine, ShellState *p){
     }
     while( (nSkip--)>0 ){
       while( xRead(&sCtx) && sCtx.cTerm==sCtx.cColSep ){}
-      sCtx.nLine++;
     }
     zSql = sqlite3_mprintf("SELECT * FROM %s", zTable);
     if( zSql==0 ){
@@ -16962,10 +17861,10 @@ static int do_meta_command(char *zLine, ShellState *p){
       goto meta_command_exit;
     }
     zSql = sqlite3_mprintf(
-      "SELECT rootpage, 0 FROM sqlite_master"
+      "SELECT rootpage, 0 FROM sqlite_schema"
       " WHERE name='%q' AND type='index'"
       "UNION ALL "
-      "SELECT rootpage, 1 FROM sqlite_master"
+      "SELECT rootpage, 1 FROM sqlite_schema"
       " WHERE name='%q' AND type='table'"
       "   AND sql LIKE '%%without%%rowid%%'",
       azArg[1], azArg[1]
@@ -17700,11 +18599,11 @@ static int do_meta_command(char *zLine, ShellState *p){
       }
     }
     if( zName!=0 ){
-      int isMaster = sqlite3_strlike(zName, "sqlite_master", '\\')==0
+      int isSchema = sqlite3_strlike(zName, "sqlite_master", '\\')==0
                   || sqlite3_strlike(zName, "sqlite_schema", '\\')==0
                   || sqlite3_strlike(zName,"sqlite_temp_master", '\\')==0
                   || sqlite3_strlike(zName,"sqlite_temp_schema", '\\')==0;
-      if( isMaster ){
+      if( isSchema ){
         char *new_argv[2], *new_colv[2];
         new_argv[0] = sqlite3_mprintf(
                       "CREATE TABLE %s (\n"
@@ -17751,7 +18650,7 @@ static int do_meta_command(char *zLine, ShellState *p){
         appendText(&sSelect, zDb, '\'');
         appendText(&sSelect, " AS sname FROM ", 0);
         appendText(&sSelect, zDb, quoteChar(zDb));
-        appendText(&sSelect, ".sqlite_master", 0);
+        appendText(&sSelect, ".sqlite_schema", 0);
       }
       sqlite3_finalize(pStmt);
 #ifndef SQLITE_OMIT_INTROSPECTION_PRAGMAS
@@ -17803,7 +18702,7 @@ static int do_meta_command(char *zLine, ShellState *p){
 
 #if defined(SQLITE_DEBUG) && defined(SQLITE_ENABLE_SELECTTRACE)
   if( c=='s' && n==11 && strncmp(azArg[0], "selecttrace", n)==0 ){
-    sqlite3SelectTrace = (int)integerValue(azArg[1]);
+    sqlite3SelectTrace = nArg>=2 ? (int)integerValue(azArg[1]) : 0xffff;
   }else
 #endif
 
@@ -18195,12 +19094,12 @@ static int do_meta_command(char *zLine, ShellState *p){
       }
     }
     if( bSchema ){
-      zSql = "SELECT lower(name) FROM sqlite_master"
+      zSql = "SELECT lower(name) FROM sqlite_schema"
              " WHERE type='table' AND coalesce(rootpage,0)>1"
-             " UNION ALL SELECT 'sqlite_master'"
+             " UNION ALL SELECT 'sqlite_schema'"
              " ORDER BY 1 collate nocase";
     }else{
-      zSql = "SELECT lower(name) FROM sqlite_master"
+      zSql = "SELECT lower(name) FROM sqlite_schema"
              " WHERE type='table' AND coalesce(rootpage,0)>1"
              " AND name NOT LIKE 'sqlite_%'"
              " ORDER BY 1 collate nocase";
@@ -18217,8 +19116,8 @@ static int do_meta_command(char *zLine, ShellState *p){
         appendText(&sQuery,"SELECT * FROM ", 0);
         appendText(&sQuery,zTab,'"');
         appendText(&sQuery," NOT INDEXED;", 0);
-      }else if( strcmp(zTab, "sqlite_master")==0 ){
-        appendText(&sQuery,"SELECT type,name,tbl_name,sql FROM sqlite_master"
+      }else if( strcmp(zTab, "sqlite_schema")==0 ){
+        appendText(&sQuery,"SELECT type,name,tbl_name,sql FROM sqlite_schema"
                            " ORDER BY name;", 0);
       }else if( strcmp(zTab, "sqlite_sequence")==0 ){
         appendText(&sQuery,"SELECT name,seq FROM sqlite_sequence"
@@ -18369,7 +19268,7 @@ static int do_meta_command(char *zLine, ShellState *p){
         appendText(&s, "||'.'||name FROM ", 0);
       }
       appendText(&s, zDbName, '"');
-      appendText(&s, ".sqlite_master ", 0);
+      appendText(&s, ".sqlite_schema ", 0);
       if( c=='t' ){
         appendText(&s," WHERE type IN ('table','view')"
                       "   AND name NOT LIKE 'sqlite_%'"
@@ -18996,6 +19895,7 @@ static int runOneSqlLine(ShellState *p, char *zSql, FILE *in, int startline){
 }
 
 int sqlite3_extension_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi);
+int sqlite3_series_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi);
 
 
 /*
@@ -19378,6 +20278,7 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
 #endif
 
   sqlite3_auto_extension((void *)sqlite3_extension_init);
+  sqlite3_auto_extension((void *)sqlite3_series_init);
 
   setBinaryMode(stdin, 0);
   setvbuf(stderr, 0, _IONBF, 0); /* Make sure stderr is unbuffered */
@@ -19586,7 +20487,7 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
       sqlite3MemTraceActivate(stderr);
     }
   }
- verify_uninitialized();
+  verify_uninitialized();
 
 
 #ifdef SQLITE_SHELL_INIT_PROC

@@ -22,9 +22,9 @@
 -------------------------------------------------------
 
 -- Define x values for input sample size
-CREATE TABLE x(x REAL);
-WITH x(x) AS(SELECT $min_x UNION ALL SELECT x+$sample_size FROM x WHERE x<$max_x)
-INSERT INTO x SELECT x FROM x;
+CREATE TABLE x AS
+SELECT $min_x+value*$sample_size x
+  FROM generate_series(0, ($max_x-$min_x)/$sample_size);
 
 -------------------------------------------------------
 -- Functions
